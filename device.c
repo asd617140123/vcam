@@ -1,3 +1,4 @@
+#define DEBUG
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/spinlock.h>
@@ -11,11 +12,17 @@
 #include "device.h"
 #include "fb.h"
 #include "videobuf.h"
-
+#include "libx.h"
 extern const char *vcam_dev_name;
 extern unsigned char allow_pix_conversion;
 extern unsigned char allow_scaling;
 extern unsigned char allow_cropping;
+
+struct layer {
+    void *data;  /* input data */
+    size_t size; /* input size */
+} layer[2];
+
 
 struct __attribute__((__packed__)) rgb_struct {
     unsigned char r, g, b;
@@ -45,7 +52,7 @@ static const struct v4l2_file_operations vcam_fops = {
 };
 
 static const struct v4l2_frmsize_discrete vcam_sizes[] = {
-    {480, 360},
+    {176, 144},
     {VGA_WIDTH, VGA_HEIGHT},
     {HD_720_WIDTH, HD_720_HEIGHT},
 };
@@ -675,7 +682,9 @@ static void submit_copy_buffer(struct vcam_out_buffer *out_buf,
                                struct vcam_device *dev)
 {
     void *in_vbuf_ptr, *out_vbuf_ptr;
-
+void* x_out_buf;
+size_t x_outbuf_size = 0;
+size_t x_size = 0;
     in_vbuf_ptr = in_buf->data;
     if (!in_vbuf_ptr) {
         pr_err("Input buffer is NULL in ready state\n");
@@ -694,8 +703,19 @@ static void submit_copy_buffer(struct vcam_out_buffer *out_buf,
                  dev->input_format.height);
         if (dev->output_format.width == dev->input_format.width &&
             dev->output_format.height == dev->input_format.height) {
+                x_size = dev->input_format.height * dev->input_format.width;
+            x_size = x_size * 3;
             pr_debug("No scaling\n");
-            memcpy(out_vbuf_ptr, in_vbuf_ptr, in_buf->filled);
+            pr_debug("x_size = %zu\n",x_size);
+            x_out_buf =  kzalloc(8*x_size, GFP_KERNEL);
+            //kfree(x_out_buf);
+            x_init();
+            void *end = x_compress(in_vbuf_ptr, x_size , x_out_buf);
+            x_outbuf_size = (char *) end - (char *) x_out_buf;
+            pr_debug("x_outbuf_size-%zu\n",x_outbuf_size);
+memcpy(out_vbuf_ptr, x_out_buf, in_buf->filled);
+            //memcpy(out_vbuf_ptr, in_vbuf_ptr, in_buf->filled);
+             kfree(x_out_buf);
         } else {
             pr_debug("Scaling\n");
             copy_scale(out_vbuf_ptr, in_vbuf_ptr, dev);

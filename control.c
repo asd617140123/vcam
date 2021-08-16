@@ -1,3 +1,4 @@
+#define DEBUG
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/device.h>
@@ -210,8 +211,8 @@ static long control_ioctl(struct file *file,
 }
 
 static struct vcam_device_spec default_vcam_spec = {
-    .width = 640,
-    .height = 480,
+    .width = 176,
+    .height = 144,
     .pix_fmt = VCAM_PIXFMT_RGB24,
 };
 

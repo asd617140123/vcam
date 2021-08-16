@@ -32,8 +32,8 @@ const char *help =
 enum ACTION { ACTION_NONE, ACTION_CREATE, ACTION_DESTROY, ACTION_MODIFY };
 
 struct vcam_device_spec device_template = {
-    .width = 640,
-    .height = 480,
+    .width = 176,
+    .height = 144,
     .pix_fmt = VCAM_PIXFMT_RGB24,
     .video_node = "",
     .fb_node = "",
