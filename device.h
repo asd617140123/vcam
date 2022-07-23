@@ -5,7 +5,9 @@
 #include <media/v4l2-common.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
+#include <media/v4l2-rect.h>
 #include <media/videobuf2-core.h>
+#include <media/videobuf2-v4l2.h>
 
 #include "vcam.h"
 
@@ -21,6 +23,7 @@
 struct vcam_in_buffer {
     void *data;
     size_t filled;
+    size_t xbar, ybar;
     uint32_t jiffies;
 };
 
@@ -32,7 +35,7 @@ struct vcam_in_queue {
 };
 
 struct vcam_out_buffer {
-    struct vb2_buffer vb;
+    struct vb2_v4l2_buffer vb;
     struct list_head list;
     size_t filled;
 };
@@ -82,11 +85,9 @@ struct vcam_device {
     size_t nr_fmts;
     struct vcam_device_format out_fmts[PIXFMTS_MAX];
 
+    struct vcam_device_spec fb_spec;
     struct v4l2_pix_format output_format;
     struct v4l2_pix_format input_format;
-
-    struct v4l2_pix_format crop_output_format;
-    struct v4l2_rect crop_cap;
 
     /* Conversion switches */
     bool conv_pixfmt_on;
@@ -96,6 +97,8 @@ struct vcam_device {
 
 struct vcam_device *create_vcam_device(size_t idx,
                                        struct vcam_device_spec *dev_spec);
+int modify_vcam_device(struct vcam_device *vcam,
+                       struct vcam_device_spec *dev_spec);
 void destroy_vcam_device(struct vcam_device *vcam);
 
 int submitter_thread(void *data);

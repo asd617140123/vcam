@@ -2,12 +2,11 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/fb.h>
-#include <linux/proc_fs.h>
+#include <linux/kernel.h>
 #include <linux/spinlock.h>
 #include <linux/version.h>
 
 #include "fb.h"
-#include "videobuf.h"
 
 struct vcamfb_info {
     struct fb_info info;
@@ -15,145 +14,6 @@ struct vcamfb_info {
     unsigned int offset;
     char name[FB_NAME_MAXLENGTH];
 };
-
-static int vcamfb_open(struct inode *ind, struct file *file)
-{
-    unsigned long flags = 0;
-
-    struct vcam_device *dev = PDE_DATA(ind);
-    if (!dev) {
-        pr_err("Private data field of PDE not initilized.\n");
-        return -ENODEV;
-    }
-
-    spin_lock_irqsave(&dev->in_fh_slock, flags);
-    if (dev->fb_isopen) {
-        spin_unlock_irqrestore(&dev->in_fh_slock, flags);
-        return -EBUSY;
-    }
-    dev->fb_isopen = true;
-    spin_unlock_irqrestore(&dev->in_fh_slock, flags);
-
-    file->private_data = dev;
-
-    return 0;
-}
-
-static int vcamfb_release(struct inode *ind, struct file *file)
-{
-    unsigned long flags = 0;
-    struct vcam_device *dev = PDE_DATA(ind);
-
-    spin_lock_irqsave(&dev->in_fh_slock, flags);
-    dev->fb_isopen = false;
-    spin_unlock_irqrestore(&dev->in_fh_slock, flags);
-    dev->in_queue.pending->filled = 0;
-    return 0;
-}
-
-static ssize_t vcamfb_write(struct file *file,
-                            const char __user *buffer,
-                            size_t length,
-                            loff_t *offset)
-{
-    struct vcam_in_queue *in_q;
-    struct vcam_in_buffer *buf;
-    size_t waiting_bytes;
-    size_t to_be_copyied;
-    unsigned long flags = 0;
-    void *data;
-
-    struct vcam_device *dev = file->private_data;
-    if (!dev) {
-        pr_err("Private data field of file not initialized yet.\n");
-        return 0;
-    }
-
-    waiting_bytes = dev->input_format.sizeimage;
-
-    in_q = &dev->in_queue;
-
-    buf = in_q->pending;
-    if (!buf) {
-        pr_err("Pending pointer set to NULL\n");
-        return 0;
-    }
-
-    /* Reset buffer if last write is too old */
-    if (buf->filled && (((int32_t) jiffies - buf->jiffies) / HZ)) {
-        pr_debug("Reseting jiffies, difference %d\n",
-                 ((int32_t) jiffies - buf->jiffies));
-        buf->filled = 0;
-    }
-    buf->jiffies = jiffies;
-
-    /* Fill the buffer */
-    /* TODO: implement real buffer handling */
-    to_be_copyied = length;
-    if ((buf->filled + to_be_copyied) > waiting_bytes)
-        to_be_copyied = waiting_bytes - buf->filled;
-
-    data = buf->data;
-    if (!data) {
-        pr_err("NULL pointer to framebuffer");
-        return 0;
-    }
-
-    if (copy_from_user(data + buf->filled, (void *) buffer, to_be_copyied) !=
-        0) {
-        pr_warn("Failed to copy_from_user!");
-    }
-    buf->filled += to_be_copyied;
-
-    if (buf->filled == waiting_bytes) {
-        spin_lock_irqsave(&dev->in_q_slock, flags);
-        swap_in_queue_buffers(in_q);
-        spin_unlock_irqrestore(&dev->in_q_slock, flags);
-    }
-
-    return to_be_copyied;
-}
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
-static struct proc_ops vcamfb_fops = {
-    .proc_open = vcamfb_open,
-    .proc_release = vcamfb_release,
-    .proc_write = vcamfb_write,
-};
-#else
-static struct file_operations vcamfb_fops = {
-    .owner = THIS_MODULE,
-    .open = vcamfb_open,
-    .release = vcamfb_release,
-    .write = vcamfb_write,
-};
-#endif
-
-struct proc_dir_entry *init_framebuffer(const char *proc_fname,
-                                        struct vcam_device *dev)
-{
-    struct proc_dir_entry *procf;
-
-    pr_debug("Creating framebuffer for /dev/%s\n", proc_fname);
-    procf = proc_create_data(proc_fname, 0666, NULL, &vcamfb_fops, dev);
-    if (!procf) {
-        pr_err("Failed to create procfs entry\n");
-        /* FIXME: report -ENODEV */
-        goto failure;
-    }
-
-failure:
-    return procf;
-}
-
-void destroy_framebuffer(const char *proc_fname)
-{
-    if (!proc_fname)
-        return;
-
-    pr_debug("Destroying framebuffer %s\n", proc_fname);
-    remove_proc_entry(proc_fname, NULL);
-}
 
 static int vcam_fb_open(struct fb_info *info, int user)
 {
@@ -178,6 +38,19 @@ static int vcam_fb_open(struct fb_info *info, int user)
     return 0;
 }
 
+static void swap_in_queue_buffers(struct vcam_in_queue *q)
+{
+    struct vcam_in_buffer *tmp;
+    if (!q)
+        return;
+    tmp = q->pending;
+    q->pending = q->ready;
+    q->ready = tmp;
+    q->pending->filled = 0;
+    q->pending->xbar = 0;
+    q->pending->ybar = 0;
+}
+
 static ssize_t vcam_fb_write(struct fb_info *info,
                              const char __user *buffer,
                              size_t length,
@@ -185,18 +58,21 @@ static ssize_t vcam_fb_write(struct fb_info *info,
 {
     struct vcam_in_queue *in_q;
     struct vcam_in_buffer *buf;
-    size_t waiting_bytes;
-    size_t to_be_copyied;
+    size_t copy_start;
+    size_t to_be_copied;
     unsigned long flags = 0;
     void *data;
+    size_t bytesperpixel;
+
+    /* virtual resolution and min/max visible resolution's coordinates */
+    size_t line_vir, line_min, line_max;
+    size_t y_vir, y_min, y_max;
 
     struct vcam_device *dev = info->par;
     if (!dev) {
         pr_err("Private data field of file not initialized yet.\n");
         return 0;
     }
-
-    waiting_bytes = dev->input_format.sizeimage;
 
     in_q = &dev->in_queue;
 
@@ -207,17 +83,19 @@ static ssize_t vcam_fb_write(struct fb_info *info,
     }
 
     /* Reset buffer if last write is too old */
-    if (buf->filled && (((int32_t) jiffies - buf->jiffies) / HZ)) {
+    if ((buf->xbar || buf->ybar || buf->filled) &&
+        (((int32_t) jiffies - buf->jiffies) / HZ)) {
         pr_debug("Reseting jiffies, difference %d\n",
                  ((int32_t) jiffies - buf->jiffies));
         buf->filled = 0;
+        buf->xbar = 0;
+        buf->ybar = 0;
     }
     buf->jiffies = jiffies;
 
     /* Fill the buffer */
-    to_be_copyied = length;
-    if ((buf->filled + to_be_copyied) > waiting_bytes)
-        to_be_copyied = waiting_bytes - buf->filled;
+    copy_start = 0;
+    to_be_copied = length;
 
     data = buf->data;
     if (!data) {
@@ -225,19 +103,67 @@ static ssize_t vcam_fb_write(struct fb_info *info,
         return 0;
     }
 
-    if (copy_from_user(data + buf->filled, (void *) buffer, to_be_copyied) !=
-        0) {
-        pr_warn("Failed to copy_from_user!");
+    if (dev->input_format.pixelformat == V4L2_PIX_FMT_RGB24) {
+        bytesperpixel = 3;
+    } else if (dev->input_format.pixelformat == V4L2_PIX_FMT_YUYV) {
+        bytesperpixel = 2;
     }
-    buf->filled += to_be_copyied;
+    line_vir = info->var.xres_virtual * bytesperpixel;
+    line_min = info->var.xoffset * bytesperpixel;
+    line_max = (info->var.xoffset + info->var.xres) * bytesperpixel;
+    y_vir = info->var.yres_virtual;
+    y_min = info->var.yoffset;
+    y_max = (info->var.yoffset + info->var.yres);
 
-    if (buf->filled == waiting_bytes) {
+    while (to_be_copied > 0 && buf->ybar < y_vir) {
+        if (buf->ybar < y_min || buf->ybar >= y_max || buf->xbar >= line_max) {
+            size_t remain = line_vir - buf->xbar;
+            if (remain > to_be_copied) {
+                buf->xbar += to_be_copied;
+                break;
+            } else {
+                copy_start += remain;
+                to_be_copied -= remain;
+                buf->xbar = 0;
+                buf->ybar += 1;
+            }
+        } else {
+            if (buf->xbar < line_min) {
+                size_t abandon = min(line_min - buf->xbar, to_be_copied);
+                copy_start += abandon;
+                to_be_copied -= abandon;
+                buf->xbar += abandon;
+            } else {
+                size_t copyline = min(line_max - buf->xbar, to_be_copied);
+                if (copy_from_user(data + buf->filled,
+                                   (void __user *) (buffer + copy_start),
+                                   copyline) != 0) {
+                    pr_warn("Failed to copy_from_user!");
+                }
+                copy_start += copyline;
+                to_be_copied -= copyline;
+                buf->filled += copyline;
+                buf->xbar += copyline;
+                /* After data is copied, check if buf->xbar reaches the
+                 * border and needs to carry.
+                 */
+                if (buf->xbar == line_vir) {
+                    buf->xbar = 0;
+                    buf->ybar += 1;
+                }
+            }
+        }
+    }
+    /* Check if buf->ybar reaches the border, which means the per-frame
+     * information is complete. Swap the double buffer.
+     */
+    if (buf->ybar == y_vir) {
         spin_lock_irqsave(&dev->in_q_slock, flags);
         swap_in_queue_buffers(in_q);
         spin_unlock_irqrestore(&dev->in_q_slock, flags);
     }
 
-    return to_be_copyied;
+    return length;
 }
 
 
@@ -250,6 +176,8 @@ static int vcam_fb_release(struct fb_info *info, int user)
     dev->fb_isopen = false;
     spin_unlock_irqrestore(&dev->in_fh_slock, flags);
     dev->in_queue.pending->filled = 0;
+    dev->in_queue.pending->xbar = 0;
+    dev->in_queue.pending->ybar = 0;
     return 0;
 }
 
@@ -266,8 +194,8 @@ static int vcam_fb_check_var(struct fb_var_screeninfo *var,
     if (var->yres > var->yres_virtual)
         var->yres_virtual = var->yres;
 
-    var->xres_virtual = var->xoffset + var->xres;
-    var->yres_virtual = var->yoffset + var->yres;
+    var->xoffset = (var->xres_virtual - var->xres) >> 1;
+    var->yoffset = (var->yres_virtual - var->yres) >> 1;
 
     /* check bpp value ALIGN 8 */
     bpp = var->bits_per_pixel;
@@ -376,6 +304,7 @@ static int vcam_fb_setcolreg(u_int regno,
 }
 
 static struct fb_ops vcamfb_ops = {
+    .owner = THIS_MODULE,
     .fb_open = vcam_fb_open,
     .fb_release = vcam_fb_release,
     .fb_write = vcam_fb_write,
@@ -406,6 +335,24 @@ static struct fb_var_screeninfo vfb_default = {
     .vmode = FB_VMODE_NONINTERLACED,
 };
 
+void set_crop_resolution(__u32 *width,
+                         __u32 *height,
+                         struct crop_ratio cropratio)
+{
+    /* set the cropping rectangular resolution */
+    struct v4l2_rect crop = {0, 0, 0, 0};
+    struct v4l2_rect r = {0, 0, *width, *height};
+    struct v4l2_rect min_r = {
+        0, 0, r.width * cropratio.numerator / cropratio.denominator,
+        r.height * cropratio.numerator / cropratio.denominator};
+    struct v4l2_rect max_r = {0, 0, r.width, r.height};
+    v4l2_rect_set_min_size(&crop, &min_r);
+    v4l2_rect_set_max_size(&crop, &max_r);
+
+    *width = crop.width;
+    *height = crop.height;
+}
+
 int vcamfb_init(struct vcam_device *dev)
 {
     struct vcamfb_info *fb_data;
@@ -426,8 +373,12 @@ int vcamfb_init(struct vcam_device *dev)
     fb_data->offset = dev->input_format.sizeimage;
     q->buffers[0].data = fb_data->addr;
     q->buffers[0].filled = 0;
+    q->buffers[0].xbar = 0;
+    q->buffers[0].ybar = 0;
     q->buffers[1].data = (void *) (fb_data->addr + fb_data->offset);
     q->buffers[1].filled = 0;
+    q->buffers[1].xbar = 0;
+    q->buffers[1].ybar = 0;
     memset(&q->dummy, 0, sizeof(struct vcam_in_buffer));
     q->pending = &q->buffers[0];
     q->ready = &q->buffers[1];
@@ -438,9 +389,11 @@ int vcamfb_init(struct vcam_device *dev)
     vfb_fix.line_length = dev->input_format.bytesperline;
 
     /* set the fb_var */
-    vfb_default.xres = dev->input_format.width;
-    vfb_default.yres = dev->input_format.height;
+    vfb_default.xres = dev->fb_spec.width;
+    vfb_default.yres = dev->fb_spec.height;
     vfb_default.bits_per_pixel = 24;
+    vfb_default.xres_virtual = dev->fb_spec.xres_virtual;
+    vfb_default.yres_virtual = dev->fb_spec.yres_virtual;
     vcam_fb_check_var(&vfb_default, info);
 
     /* set the fb_info */
@@ -451,10 +404,19 @@ int vcamfb_init(struct vcam_device *dev)
     info->par = dev;
     info->pseudo_palette = NULL;
     info->flags = FBINFO_FLAG_DEFAULT;
+    info->device = &dev->vdev.dev;
+    INIT_LIST_HEAD(&info->modelist);
 
-    ret = fb_alloc_cmap(&info->cmap, 256, 0);
-    if (ret < 0)
-        return -EINVAL;
+    /* set the fb_cmap */
+    info->cmap.red = NULL;
+    info->cmap.green = NULL;
+    info->cmap.blue = NULL;
+    info->cmap.transp = NULL;
+
+    if (fb_alloc_cmap(&info->cmap, 256, 0)) {
+        pr_err("Failed to allocate cmap!");
+        return -ENOMEM;
+    }
 
     ret = register_framebuffer(info);
     if (ret < 0)
@@ -488,17 +450,8 @@ void vcamfb_update(struct vcam_device *dev)
     struct fb_info *info = &fb_data->info;
     struct vcam_in_queue *q = &dev->in_queue;
 
-    /* check input_format */
-    if (dev->input_format.width != dev->output_format.width) {
-        dev->input_format.width = dev->output_format.width;
-        dev->input_format.height = dev->output_format.height;
-        dev->input_format.bytesperline = dev->output_format.bytesperline;
-        dev->input_format.sizeimage =
-            dev->input_format.height * dev->input_format.bytesperline;
-    }
-
-    /* remalloc the framebuffer */
-    if (info->var.xres_virtual != dev->output_format.width) {
+    /* remalloc the framebuffer and vcam_in_queue */
+    if (info->fix.smem_len != dev->input_format.sizeimage) {
         unsigned int size;
         vfree(fb_data->addr);
         fb_data->offset = dev->input_format.sizeimage;
@@ -507,28 +460,29 @@ void vcamfb_update(struct vcam_device *dev)
         q->buffers[0].data = fb_data->addr;
         q->buffers[1].data = (void *) (fb_data->addr + fb_data->offset);
         q->buffers[0].filled = 0;
+        q->buffers[0].xbar = 0;
+        q->buffers[0].ybar = 0;
         q->buffers[1].filled = 0;
+        q->buffers[1].xbar = 0;
+        q->buffers[1].ybar = 0;
         memset(&q->dummy, 0, sizeof(struct vcam_in_buffer));
 
         /* reset the fb_fix */
         info->fix.smem_len = dev->input_format.sizeimage;
         info->fix.smem_start = (unsigned long) fb_data->addr;
+        info->fix.line_length = dev->input_format.bytesperline;
 
         /* reset the fb_info */
         info->screen_base = (char __iomem *) fb_data->addr;
-    }
 
-    /* reset the fb_var and fb_fix */
-    if (dev->conv_crop_on) {
-        info->var.xres = dev->crop_output_format.width;
-        info->var.yres = dev->crop_output_format.height;
-    } else {
-        info->var.xres = dev->output_format.width;
-        info->var.yres = dev->output_format.height;
+        /* reset the fb_var */
+        info->var.xres = dev->fb_spec.width;
+        info->var.yres = dev->fb_spec.height;
+        info->var.xres_virtual = dev->fb_spec.xres_virtual;
+        info->var.yres_virtual = dev->fb_spec.yres_virtual;
+        info->var.xoffset = (info->var.xres_virtual - info->var.xres) >> 1;
+        info->var.yoffset = (info->var.yres_virtual - info->var.yres) >> 1;
     }
-    info->var.xres_virtual = dev->input_format.width;
-    info->var.yres_virtual = dev->input_format.height;
-    info->fix.line_length = dev->input_format.bytesperline;
 }
 
 char *vcamfb_get_devnode(struct vcam_device *dev)

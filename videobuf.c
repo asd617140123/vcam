@@ -7,69 +7,6 @@
 
 #include "videobuf.h"
 
-static inline int init_vcam_in_buffer(struct vcam_in_buffer *buf, size_t size)
-{
-    buf->data = vmalloc(size);
-    if (!buf->data) {
-        pr_err("Failed to allocate input buffer\n");
-        return -ENOMEM;
-    }
-    buf->filled = 0;
-    return 0;
-}
-
-static inline void destroy_vcam_in_buffer(struct vcam_in_buffer *buf)
-{
-    vfree(buf->data);
-}
-
-void swap_in_queue_buffers(struct vcam_in_queue *q)
-{
-    struct vcam_in_buffer *tmp;
-    if (!q)
-        return;
-    tmp = q->pending;
-    q->pending = q->ready;
-    q->ready = tmp;
-    q->pending->filled = 0;
-}
-
-int vcam_in_queue_setup(struct vcam_in_queue *q, size_t size)
-{
-    int i;
-    int ret = 0;
-
-    /* Initialize buffers */
-    for (i = 0; i < 2; i++) {
-        ret = init_vcam_in_buffer(&q->buffers[i], size);
-        if (ret)
-            break;
-    }
-
-    if (ret) {
-        pr_err("input queue alloc failure\n");
-        for (; i > 0; i--)
-            destroy_vcam_in_buffer(&q->buffers[i - 1]);
-        return ret;
-    }
-
-    /* Initialize dummy buffer */
-    memset(&q->dummy, 0x00, sizeof(struct vcam_in_buffer));
-
-    /* Initialize pointers to buffers */
-    q->pending = &q->buffers[0];
-    q->ready = &q->buffers[1];
-
-    return ret;
-}
-
-void vcam_in_queue_destroy(struct vcam_in_queue *q)
-{
-    int i;
-    for (i = 0; i < 2; i++)
-        destroy_vcam_in_buffer(&q->buffers[i]);
-}
-
 static int vcam_out_queue_setup(struct vb2_queue *vq,
                                 unsigned int *nbuffers,
                                 unsigned int *nplanes,
@@ -82,6 +19,12 @@ static int vcam_out_queue_setup(struct vb2_queue *vq,
 
     if (*nbuffers < 2)
         *nbuffers = 2;
+
+    if (*nplanes > 0) {
+        if (sizes[0] < size)
+            return -EINVAL;
+        return 0;
+    }
 
     *nplanes = 1;
 
@@ -109,7 +52,9 @@ static void vcam_out_buffer_queue(struct vb2_buffer *vb)
 {
     unsigned long flags = 0;
     struct vcam_device *dev = vb2_get_drv_priv(vb->vb2_queue);
-    struct vcam_out_buffer *buf = container_of(vb, struct vcam_out_buffer, vb);
+    struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+    struct vcam_out_buffer *buf =
+        container_of(vbuf, struct vcam_out_buffer, vb);
     struct vcam_out_queue *q = &dev->vcam_out_vidq;
     buf->filled = 0;
 
@@ -151,7 +96,7 @@ static void vcam_stop_streaming(struct vb2_queue *vb2_q)
         struct vcam_out_buffer *buf =
             list_entry(q->active.next, struct vcam_out_buffer, list);
         list_del(&buf->list);
-        vb2_buffer_done(&buf->vb, VB2_BUF_STATE_ERROR);
+        vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
         pr_debug("Throwing out buffer\n");
     }
     spin_unlock_irqrestore(&dev->out_q_slock, flags);

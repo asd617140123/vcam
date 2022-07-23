@@ -45,7 +45,7 @@ static ssize_t control_read(struct file *file,
 {
     int len;
     static const char *str = "Virtual V4L2 compatible camera device\n";
-    pr_debug("read %ld %dB\n", (long) buffer, (int) length);
+    pr_debug("read %p %dB\n", buffer, (int) length);
     len = strlen(str);
     if (len < length)
         len = length;
@@ -59,7 +59,7 @@ static ssize_t control_write(struct file *file,
                              size_t length,
                              loff_t *offset)
 {
-    pr_debug("write %ld %dB\n", (long) buffer, (int) length);
+    pr_debug("write %p %dB\n", buffer, (int) length);
     return length;
 }
 
@@ -71,17 +71,15 @@ static int control_iocontrol_get_device(struct vcam_device_spec *dev_spec)
         return -EINVAL;
 
     dev = ctldev->vcam_devices[dev_spec->idx];
-    dev_spec->width = dev->input_format.width;
-    dev_spec->height = dev->input_format.height;
-    if (dev->input_format.pixelformat == V4L2_PIX_FMT_YUYV)
-        dev_spec->pix_fmt = VCAM_PIXFMT_YUYV;
-    else
-        dev_spec->pix_fmt = VCAM_PIXFMT_RGB24;
+    dev_spec->width = dev->fb_spec.xres_virtual;
+    dev_spec->height = dev->fb_spec.yres_virtual;
+    dev_spec->pix_fmt = dev->fb_spec.pix_fmt;
+    dev_spec->cropratio = dev->fb_spec.cropratio;
 
     strncpy((char *) &dev_spec->fb_node, (const char *) vcamfb_get_devnode(dev),
             sizeof(dev_spec->fb_node));
     snprintf((char *) &dev_spec->video_node, sizeof(dev_spec->video_node),
-             "/dev/video%d", dev->vdev.minor);
+             "/dev/video%d", dev->vdev.num);
     return 0;
 }
 
@@ -89,54 +87,16 @@ static int control_iocontrol_modify_input_setting(
     struct vcam_device_spec *dev_spec)
 {
     struct vcam_device *dev;
-    unsigned long flags = 0;
+    int res;
 
     if (ctldev->vcam_device_count <= dev_spec->idx)
         return -EINVAL;
 
     dev = ctldev->vcam_devices[dev_spec->idx];
 
-    spin_lock_irqsave(&dev->in_fh_slock, flags);
-    if (dev->fb_isopen) {
-        spin_unlock_irqrestore(&dev->in_fh_slock, flags);
-        return -EBUSY;
-    }
-    dev->fb_isopen = true;
-    spin_unlock_irqrestore(&dev->in_fh_slock, flags);
+    res = modify_vcam_device(dev, dev_spec);
 
-    if (dev_spec->width && dev_spec->height) {
-        dev->input_format.width = dev_spec->width;
-        dev->input_format.height = dev_spec->height;
-    }
-
-    if (dev_spec->pix_fmt == VCAM_PIXFMT_YUYV)
-        dev->input_format.pixelformat = V4L2_PIX_FMT_YUYV;
-    else if (dev_spec->pix_fmt == VCAM_PIXFMT_RGB24)
-        dev->input_format.pixelformat = V4L2_PIX_FMT_RGB24;
-
-    if (dev->input_format.pixelformat == V4L2_PIX_FMT_YUYV) {
-        dev->input_format.colorspace = V4L2_COLORSPACE_SMPTE170M;
-        dev->input_format.bytesperline = dev_spec->width << 1;
-    } else {
-        dev->input_format.colorspace = V4L2_COLORSPACE_SRGB;
-        dev->input_format.bytesperline = dev_spec->width * 3;
-    }
-    dev->input_format.sizeimage =
-        dev->input_format.bytesperline * dev_spec->height;
-
-    spin_lock_irqsave(&dev->in_q_slock, flags);
-    vcam_in_queue_destroy(&dev->in_queue);
-    vcam_in_queue_setup(&dev->in_queue, dev->input_format.sizeimage);
-
-    pr_debug("Input format set (%dx%d)(%dx%d)\n", dev_spec->width,
-             dev_spec->height, dev->input_format.width,
-             dev->input_format.height);
-    spin_unlock_irqrestore(&dev->in_q_slock, flags);
-
-    spin_lock_irqsave(&dev->in_fh_slock, flags);
-    dev->fb_isopen = false;
-    spin_unlock_irqrestore(&dev->in_fh_slock, flags);
-    return 0;
+    return res;
 }
 
 static int control_iocontrol_destroy_device(struct vcam_device_spec *dev_spec)
@@ -211,8 +171,9 @@ static long control_ioctl(struct file *file,
 }
 
 static struct vcam_device_spec default_vcam_spec = {
-    .width = 176,
-    .height = 144,
+    .width = 640,
+    .height = 480,
+    .cropratio = {.numerator = 3, .denominator = 4},
     .pix_fmt = VCAM_PIXFMT_RGB24,
 };
 
@@ -241,7 +202,7 @@ int request_vcam_device(struct vcam_device_spec *dev_spec)
     idx = ctldev->vcam_device_count++;
     ctldev->vcam_devices[idx] = vcam;
     spin_unlock_irqrestore(&ctldev->vcam_devices_lock, flags);
-    return idx;
+    return 0;
 }
 
 static struct control_device *alloc_control_device(void)
